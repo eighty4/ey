@@ -1,0 +1,105 @@
+name: Publish to npm
+run-name: Publish ${{ inputs.semver-bump }} bump
+
+on:
+  workflow_dispatch:
+    inputs:
+      semver-bump:
+        description: Semver bump release type
+        required: true
+        type: choice
+        default: prerelease
+        options:
+          - major
+          - minor
+          - patch
+          - prerelease
+
+concurrency: publish
+
+jobs:
+  check-build-params:
+    runs-on: ubuntu-latest
+    outputs:
+      npm-tag: ${{ inputs.semver-bump == 'prerelease' && 'next' || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: changelog entries
+        if: ${{ inputs.semver-bump != 'prerelease' }}
+        run: bunx @eighty4/changelog check
+
+  verify:
+    uses: ./.github/workflows/ci_verify.yml
+    needs: check-build-params
+
+  create-git-tag:
+    runs-on: ubuntu-latest
+    needs: [check-build-params, verify]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+      - id: bump
+        run: |
+          GIT_TAG=$(npm version ${{ inputs.semver-bump }} --no-git-tag-version)
+          echo "version=${GIT_TAG:1}" >> "$GITHUB_OUTPUT"
+          echo "tag=$GIT_TAG" >> "$GITHUB_OUTPUT"
+      - if: inputs.semver-bump != 'prerelease'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: bunx @eighty4/changelog rollover "v$VERSION"
+      - id: push
+        env:
+          GIT_TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          git config --global user.name "Adam McKee"
+          git config --global user.email "adam.be.g84d@gmail.com"
+          git add package.json CHANGELOG.md
+          git commit -m "publishing $GIT_TAG as @${{ needs.check-build-params.outputs.npm-tag }}"
+          git tag $GIT_TAG
+          git push --atomic origin main $GIT_TAG
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      version: ${{ steps.bump.outputs.version }}
+
+  npm-publish:
+    needs: [check-build-params, create-git-tag]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+          ref: ${{ needs.create-git-tag.outputs.tag }}
+      - uses: oven-sh/setup-bun@v2
+      - run: bun i
+      - run: bun run build
+      - name: publish
+        env:
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bun publish --access public --tag ${{ needs.check-build-params.outputs.npm-tag }}
+
+  create-release-notes:
+    needs: [create-git-tag, npm-publish]
+    uses: ./.github/workflows/release_notes.yml
+    with:
+      npm_version: ${{ needs.create-git-tag.version }}
+      git_tag: ${{ needs.create-git-tag.tag }}
+      prerelease: ${{ inputs.semver-bump == 'prerelease' }}
+
+  create-gh-release:
+    uses: ./.github/workflows/gh_release.yml
+    needs: [create-git-tag, create-release-notes, npm-publish]
+    permissions:
+      contents: write
+    secrets: inherit
+    with:
+      title: '${{ needs.create-git-tag.outputs.tag }}'
+      release_notes: ${{ needs.create-release-notes.outputs.notes }}
+      prerelease: ${{ inputs.semver-bump == 'prerelease' && 'true' || 'false' }}
+      latest: ${{ inputs.semver-bump == 'prerelease' && 'false' || 'true' }}
+      tag: ${{ needs.create-git-tag.outputs.tag }}
